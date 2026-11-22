@@ -220,7 +220,13 @@ pub struct Haptics {
     pub click: Option<i16>,
     /// The file the driver says the motor's resonant frequency in, in
     /// tenths of a hertz whatever its label.
+    #[serde(default)]
     pub resonance: String,
+    /// Sysfs directory for a Meizu AW8697 haptic motor (such as
+    /// `/sys/class/meizu/motor`), which plays clicks via `set_mback` and
+    /// `gain` rather than Linux force-feedback events.
+    #[serde(default)]
+    pub sysfs: Option<String>,
     pub strength: Strength,
     /// Whether the strength goes into the samples made, each made that
     /// share of itself and played at the driver's full magnitude, on
@@ -552,8 +558,12 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            if let Some(dir) = &haptics.sysfs {
+                ensure!(Path::new(dir).is_absolute(), "[haptics] sysfs: {dir} is not an absolute path");
+            } else {
+                let file = &haptics.resonance;
+                ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            }
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
@@ -669,11 +679,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_m2391() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/m2391.toml")).unwrap();
+        assert_eq!(cfg.device.codename, "m2391");
+        assert_eq!(cfg.device.brand, "Meizu");
+        assert_eq!(cfg.display.width, 1080);
+        assert_eq!(cfg.display.height, 2400);
+        assert_eq!(cfg.display.density, 420);
+        assert_eq!(cfg.modules.load, ["goodix_ts", "haptic_hv"]);
+        let haptics = cfg.haptics.expect("m2391 has an AW8697 motor");
+        assert_eq!(haptics.sysfs.as_deref(), Some("/sys/class/meizu/motor"));
+        assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 1.0 });
+        let wlan = cfg.wlan.expect("m2391 has WCN7850 WLAN");
+        assert_eq!(wlan.modules, ["qca_cld3_kiwi_v2"]);
+        assert_eq!(wlan.supplicant, "/vendor/bin/hw/wpa_supplicant.m2391");
+    }
+
+    #[test]
     fn a_click_is_kept_or_made_and_its_strengths_rise() {
         let with = |body: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[haptics]\n{body}\n"));
         let (strength, resonance) = ("strength = { lightest = 0.25, strongest = 1.0 }", "resonance = \"/sys/class/qcom-haptics/lra_frequency_hz\"");
         assert!(with(&format!("{resonance}\n{strength}")).is_ok(), "a click made");
         assert!(with(&format!("click = 0\n{resonance}\n{strength}")).is_ok(), "a click kept");
+        assert!(with(&format!("sysfs = \"/sys/class/meizu/motor\"\n{strength}")).is_ok(), "a sysfs motor");
+        assert!(with(&format!("sysfs = \"sys/class/meizu/motor\"\n{strength}")).is_err(), "a relative sysfs path");
         assert!(with(&format!("click = 0\n{strength}")).is_err(), "no motor's resonance to make the ticks at");
         assert!(with(&format!("resonance = \"sys/f\"\n{strength}")).is_err(), "a file named from nowhere");
         assert!(with(resonance).is_err(), "a click without its strengths");

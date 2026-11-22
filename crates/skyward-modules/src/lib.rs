@@ -35,6 +35,7 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
         for m in graph.load_order(std::slice::from_ref(&file)) {
             let path = graph
                 .resolve_path(&m)
+                .or_else(|| dirs.iter().find_map(|d| resolve_in(d, &m)))
                 .ok_or_else(|| anyhow!("{m} is listed in {}/modules.dep but missing", dir.display()))?;
             insmod(&path, "")?;
             loaded.push(path);
@@ -112,12 +113,16 @@ impl ModuleGraph {
     }
 
     pub fn resolve_path(&self, module: &str) -> Option<PathBuf> {
-        let direct = self.base.join(module);
-        if direct.exists() {
-            return Some(direct);
-        }
-        find_file(&self.base, module)
+        resolve_in(&self.base, module)
     }
+}
+
+fn resolve_in(base: &Path, module: &str) -> Option<PathBuf> {
+    let direct = base.join(module);
+    if direct.exists() {
+        return Some(direct);
+    }
+    find_file(base, module)
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {

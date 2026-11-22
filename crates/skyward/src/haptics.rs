@@ -5,7 +5,7 @@ use skyward_config::Strength;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,24 +22,40 @@ const TICKS_STRENGTH: f32 = 0.415;
 /// phone's own system leaves them: the motor comes to rest on its own
 /// before taking them away brakes it.
 const TICKS_REST: Duration = Duration::from_millis(40);
+/// Duration of a finite AW8697 mBack click.
+const MBACK_CLICK_DURATION: Duration = Duration::from_millis(15);
+/// Spacing between the two screen-off ticks on AW8697.
+const MBACK_SECOND_TICK_DELAY: Duration = Duration::from_millis(55);
+/// Maximum gain accepted by Meizu's AW8697 sysfs interface.
+const AW8697_MAX_GAIN: f32 = 128.0;
 
-/// The vibration motor, played through the kernel's force-feedback
-/// events. The driver fills its queue with a made click's samples as the
-/// click is loaded, refilling it for no second play, and keeps the click
-/// playing after its samples have run out, even when told to stop, until
-/// the click is taken away. So each click is loaded as it is played, at the
-/// strength the slider gives, and taken away once it has played out.
+/// The vibration motor, either played through Linux force-feedback events
+/// or through Meizu's AW8697 sysfs interface (`/sys/class/meizu/motor`).
 pub struct Haptics {
+    backend: Backend,
+    strength: Strength,
+}
+
+enum Backend {
+    ForceFeedback(ForceFeedback),
+    MeizuMotor(MeizuMotor),
+}
+
+struct ForceFeedback {
     dev: File,
     click: Click,
     ticks: Click,
-    strength: Strength,
     /// Whether the driver is given the strength in the samples it plays.
     scale_samples: bool,
     /// The click playing, by its slot and its count, until it is taken
     /// away; a click taken away early by the next is not taken away again.
     playing: Arc<Mutex<Option<(i16, u64)>>>,
     clicks: u64,
+}
+
+struct MeizuMotor {
+    dir: PathBuf,
+    lock: Arc<Mutex<()>>,
 }
 
 /// What a click is.
@@ -53,10 +69,37 @@ enum Click {
 }
 
 impl Haptics {
-    /// The force-feedback device and the configured click. Loading a click
-    /// fills the driver's queue with what it plays, so the click is loaded
-    /// only as it is played.
+    /// Open the configured vibration motor.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
+        let backend = match &cfg.sysfs {
+            Some(dir) => Backend::MeizuMotor(MeizuMotor::open(Path::new(dir))?),
+            None => Backend::ForceFeedback(ForceFeedback::open(cfg)?),
+        };
+        Ok(Haptics { backend, strength: cfg.strength })
+    }
+
+    /// One short click at the strength the slider's `position` gives, after
+    /// taking away one still playing. Gives how long it plays.
+    pub fn click(&mut self, position: f32) -> Result<Duration> {
+        let s = share(&self.strength, position);
+        match &mut self.backend {
+            Backend::ForceFeedback(ff) => ff.start(false, s),
+            Backend::MeizuMotor(motor) => motor.click(position, s),
+        }
+    }
+
+    /// The ticks of the screen going off, as strong as the phone's own
+    /// system plays them whatever the slider says. Gives how long they play.
+    pub fn ticks(&mut self) -> Result<Duration> {
+        match &mut self.backend {
+            Backend::ForceFeedback(ff) => ff.start(true, TICKS_STRENGTH),
+            Backend::MeizuMotor(motor) => motor.ticks(),
+        }
+    }
+}
+
+impl ForceFeedback {
+    fn open(cfg: &skyward_config::Haptics) -> Result<Self> {
         let (path, dev) = motor()?;
         let hz = resonance(&cfg.resonance)?;
         let click = match cfg.click {
@@ -70,19 +113,7 @@ impl Haptics {
             }
         };
         let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, scale_samples: cfg.scale_samples, playing: Arc::new(Mutex::new(None)), clicks: 0 })
-    }
-
-    /// One short click at the strength the slider's `position` gives, after
-    /// taking away one still playing. Gives how long it plays.
-    pub fn click(&mut self, position: f32) -> Result<Duration> {
-        self.start(false, share(&self.strength, position))
-    }
-
-    /// The ticks of the screen going off, as strong as the phone's own
-    /// system plays them whatever the slider says. Gives how long they play.
-    pub fn ticks(&mut self) -> Result<Duration> {
-        self.start(true, TICKS_STRENGTH)
+        Ok(ForceFeedback { dev, click, ticks, scale_samples: cfg.scale_samples, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// Play the ticks, or else the click, at `share` of its full strength,
@@ -116,6 +147,79 @@ impl Haptics {
         });
         Ok(length)
     }
+}
+
+impl MeizuMotor {
+    fn open(dir: &Path) -> Result<Self> {
+        ensure!(dir.join("set_mback").exists(), "{} has no set_mback control", dir.display());
+        ensure!(dir.join("gain").exists(), "{} has no gain control", dir.display());
+        let _ = write_sysfs(&dir.join("enable"), "0");
+        let _ = write_sysfs(&dir.join("cont"), "0");
+        if ram_num(dir) == Some(0) {
+            let _ = write_sysfs(&dir.join("ram_update"), "1");
+        }
+        eprintln!("haptics {}: Meizu AW8697 mBack motor", dir.display());
+        Ok(Self { dir: dir.to_path_buf(), lock: Arc::new(Mutex::new(())) })
+    }
+
+    fn click(&self, position: f32, share: f32) -> Result<Duration> {
+        let level = mback_level(position);
+        let gain = aw8697_gain(share);
+        let _guard = self.lock.lock().expect("no thread panics while holding the motor lock");
+        trigger_mback(&self.dir, level, gain)?;
+        Ok(MBACK_CLICK_DURATION)
+    }
+
+    fn ticks(&self) -> Result<Duration> {
+        let first_gain = aw8697_gain(TICKS_STRENGTH);
+        let second_gain = aw8697_gain(TICKS_STRENGTH * 0.79);
+        {
+            let _guard = self.lock.lock().expect("no thread panics while holding the motor lock");
+            trigger_mback(&self.dir, 0, first_gain)?;
+        }
+        let dir = self.dir.clone();
+        let lock = self.lock.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(MBACK_SECOND_TICK_DELAY);
+            let _guard = lock.lock().expect("no thread panics while holding the motor lock");
+            if let Err(e) = trigger_mback(&dir, 0, second_gain) {
+                eprintln!("haptics second tick: {e:#}");
+            }
+        });
+        Ok(MBACK_SECOND_TICK_DELAY + MBACK_CLICK_DURATION)
+    }
+}
+
+fn mback_level(position: f32) -> u8 {
+    let p = position.clamp(0.0, 1.0);
+    if p < 0.34 {
+        0
+    } else if p > 0.67 {
+        2
+    } else {
+        1
+    }
+}
+
+fn aw8697_gain(share: f32) -> u32 {
+    (share.clamp(0.0, 1.0) * AW8697_MAX_GAIN).round().clamp(1.0, AW8697_MAX_GAIN) as u32
+}
+
+fn trigger_mback(dir: &Path, level: u8, gain: u32) -> Result<()> {
+    // set_mback selects finite RAM wave 16/17/18 and starts it; it can reset
+    // gain internally, so apply gain immediately after starting.
+    write_sysfs(&dir.join("set_mback"), &format!("{level} 1"))?;
+    write_sysfs(&dir.join("gain"), &gain.to_string())
+}
+
+fn ram_num(dir: &Path) -> Option<u32> {
+    let text = fs::read_to_string(dir.join("ram_num")).ok()?;
+    text.split_whitespace().rev().find_map(|tok| tok.parse::<u32>().ok())
+}
+
+fn write_sysfs(path: &Path, value: &str) -> Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path).with_context(|| format!("open {}", path.display()))?;
+    file.write_all(value.as_bytes()).with_context(|| format!("write {value:?} to {}", path.display()))
 }
 
 /// Play the configured click once at the slider's `position`, or else the
@@ -264,4 +368,49 @@ fn erase(dev: &File, id: i16) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aw8697_level_and_gain_follow_slider() {
+        assert_eq!(mback_level(0.0), 0);
+        assert_eq!(mback_level(0.5), 1);
+        assert_eq!(mback_level(1.0), 2);
+        assert_eq!(aw8697_gain(0.0), 1);
+        assert_eq!(aw8697_gain(0.5), 64);
+        assert_eq!(aw8697_gain(1.0), 128);
+    }
+
+    #[test]
+    fn meizu_motor_writes_mback_and_gain() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["set_mback", "gain", "enable", "cont", "ram_update"] {
+            fs::write(dir.path().join(name), "").unwrap();
+        }
+        fs::write(dir.path().join("ram_num"), "ram_num = 0\n").unwrap();
+        let cfg = skyward_config::Haptics {
+            click: None,
+            resonance: String::new(),
+            sysfs: Some(dir.path().to_str().unwrap().to_string()),
+            strength: Strength { lightest: 0.25, strongest: 1.0 },
+            scale_samples: false,
+        };
+        let mut haptics = Haptics::open(&cfg).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("enable")).unwrap(), "0");
+        assert_eq!(fs::read_to_string(dir.path().join("cont")).unwrap(), "0");
+        assert_eq!(fs::read_to_string(dir.path().join("ram_update")).unwrap(), "1");
+        let len = haptics.click(0.5).unwrap();
+        assert_eq!(len, MBACK_CLICK_DURATION);
+        assert_eq!(fs::read_to_string(dir.path().join("set_mback")).unwrap(), "1 1");
+        assert_eq!(fs::read_to_string(dir.path().join("gain")).unwrap(), "64");
+
+        // When RAM waveforms are already loaded, ram_update is not triggered again.
+        fs::write(dir.path().join("ram_num"), "ram_num = 20\n").unwrap();
+        fs::write(dir.path().join("ram_update"), "").unwrap();
+        let _ = Haptics::open(&cfg).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("ram_update")).unwrap(), "");
+    }
 }

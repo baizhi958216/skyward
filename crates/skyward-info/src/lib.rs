@@ -428,7 +428,12 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
         }
     }
     let Some(dir) = first else { return Ok(None) };
-    let charge = match read(dir.join("status"))?.as_str() {
+    let status = match fs::read_to_string(dir.join("status")) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if is_no_data(&e) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}/status", dir.display())),
+    };
+    let charge = match status.as_str() {
         "Charging" => Charge::Charging,
         "Discharging" => Charge::Discharging,
         "Not charging" => Charge::NotCharging,
@@ -436,8 +441,13 @@ fn battery(root: &Path) -> Result<Option<Battery>> {
         "Unknown" => Charge::Unknown,
         other => bail!("{}: status {other:?}", dir.display()),
     };
+    let capacity = match fs::read_to_string(dir.join("capacity")) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if is_no_data(&e) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("read {}/capacity", dir.display())),
+    };
     Ok(Some(Battery {
-        level: parse(&read(dir.join("capacity"))?, "capacity")?,
+        level: parse(&capacity, "capacity")?,
         charge,
         temp: parse_opt(dir.join("temp"), "temp")?,
         health: read_opt(dir.join("health"))?,
@@ -463,10 +473,14 @@ fn online(dir: &Path) -> Result<bool> {
 /// without one has no say, and one whose driver cannot tell yet, as
 /// Qualcomm's USB-C connector cannot early in a boot, answers "try again":
 /// either is taken as offline, and the next reading asks again.
+fn is_no_data(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENODATA)
+}
+
 fn said_online(read: std::io::Result<String>) -> std::io::Result<bool> {
     match read {
         Ok(s) => Ok(s.trim() == "1"),
-        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock) => Ok(false),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock) || is_no_data(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }
