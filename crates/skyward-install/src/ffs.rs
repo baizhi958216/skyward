@@ -367,9 +367,11 @@ pub struct Endpoints {
     shared: Arc<Shared>,
 }
 
-/// The cable came out while a transfer waited.
+/// The cable came out, or the host reset the endpoint while a transfer waited
+/// (e.g. `ClearFeature(ENDPOINT_HALT)` on newer kernels such as Linux 6.18
+/// dwc3, which cancels queued requests with `EPIPE` or `ECONNRESET`).
 fn aborted(e: &io::Error) -> bool {
-    e.raw_os_error() == Some(libc::ESHUTDOWN)
+    matches!(e.raw_os_error(), Some(libc::ESHUTDOWN | libc::EPIPE | libc::ECONNRESET))
 }
 
 impl Link for Endpoints {
