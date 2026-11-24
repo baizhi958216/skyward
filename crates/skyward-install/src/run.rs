@@ -637,13 +637,31 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
         Ok(slots) => slots,
         Err(e) => return ctx.send(Event::Reflashed(Reflash::Failed(format!("{e:#}")))),
     };
-    let mut told: Option<Instant> = None;
-    let written = kept.write(&slots, &mut |done, total| {
-        if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
-            ctx.send(Event::Progress(Stage::Reflashing { done, total }));
-            told = Some(Instant::now());
+    let mut unmarked = Vec::new();
+    let readied = (|| -> Result<()> {
+        for &slot in &slots {
+            let device = image::device(Path::new(skyward_block::BY_NAME), "recovery", slot);
+            if skyward_block::read_only(&device)? {
+                skyward_block::set_read_only(&device, false)?;
+                unmarked.push(device);
+            }
         }
+        Ok(())
+    })();
+    let mut told: Option<Instant> = None;
+    let written = readied.and_then(|()| {
+        kept.write(&slots, &mut |done, total| {
+            if done == total || told.is_none_or(|t| t.elapsed() >= PROGRESS_EVERY) {
+                ctx.send(Event::Progress(Stage::Reflashing { done, total }));
+                told = Some(Instant::now());
+            }
+        })
     });
+    for device in unmarked {
+        if let Err(e) = skyward_block::set_read_only(&device, true) {
+            let _ = kmsg(&format!("install: {} is left writable: {e:#}", device.display()));
+        }
+    }
     let _ = kmsg(&format!("install: this recovery written back to {slots:?}: {written:?}"));
     ctx.send(Event::Reflashed(match written {
         Ok(()) => Reflash::Written(slots),
